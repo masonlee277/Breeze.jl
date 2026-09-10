@@ -459,3 +459,12 @@ end
     pˢᵗ = standard_pressure(dynamics)
     return LiquidIceDensityState(θ, q, pˢᵗ, ρ, formulation.temperature_solver)
 end
+
+using Breeze.PotentialTemperatureFormulations: DensityEnergyFluxResponse, materialize_temperature_solver
+
+function AtmosphereModels.energy_flux_response(formulation::LiquidIcePotentialTemperatureFormulation,
+                                               dynamics::CompressibleDynamics, grid, microphysics)
+    return DensityEnergyFluxResponse(eltype(grid)(AtmosphereModels.standard_pressure(dynamics)),
+        materialize_temperature_solver(formulation.temperature_solver, dynamics, grid),
+        Val(AtmosphereModels.moisture_prognostic_name(microphysics)))
+end

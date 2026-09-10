@@ -214,3 +214,7 @@ function liquid_ice_potential_temperature end
 Return the liquid-ice potential temperature density field for the given model.
 """
 function liquid_ice_potential_temperature_density end
+
+# Typed metadata for physical energy fluxes; specialized by theta formulations.
+energy_flux_response(formulation, dynamics, grid, microphysics) = nothing
+energy_flux_response(formulation::Symbol, args...) = energy_flux_response(Val(formulation), args...)

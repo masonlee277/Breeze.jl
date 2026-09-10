@@ -33,6 +33,7 @@ const c = Center()
 
 include("potential_temperature_formulation.jl")
 include("potential_temperature_tendency.jl")
+include("energy_flux_response.jl")
 
 # Kernel wrapper for launching potential_temperature_tendency
 # (needs to be defined after potential_temperature_tendency is defined)

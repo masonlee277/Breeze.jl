@@ -1,9 +1,10 @@
 using Breeze.AtmosphereModels.Diagnostics: Diagnostics
-using Breeze.AtmosphereModels: AtmosphereModel, specific_prognostic_moisture
+using Breeze.AtmosphereModels: AtmosphereModel, specific_prognostic_moisture, moisture_prognostic_name
 
 using Oceananigans.Fields: Field, set!
-using Breeze.Thermodynamics: temperature
-using Breeze.BoundaryConditions: theta_to_energy_bcs, materialize_atmosphere_field_bcs
+using Breeze.Thermodynamics: temperature, LiquidIceDensityState, mixture_gas_constant
+using Breeze.BoundaryConditions: theta_to_energy_bcs, materialize_atmosphere_field_bcs,
+    map_field_boundary_conditions, set_energy_flux_response
 
 const PotentialTemperatureModel = AtmosphereModel{<:Any, <:LiquidIcePotentialTemperatureFormulation}
 
@@ -18,14 +19,15 @@ AtmosphereModels.liquid_ice_potential_temperature(model::PotentialTemperatureMod
 AtmosphereModels.static_energy(model::PotentialTemperatureModel) = Diagnostics.StaticEnergy(model, :specific)
 
 """
-    static_energy_density(model::PotentialTemperatureModel)
+$(TYPEDSIGNATURES)
 
 Return the static energy density as a `Field` with boundary conditions that return
 energy fluxes when used with `BoundaryConditionOperation`.
 
 For `LiquidIcePotentialTemperatureFormulation`, the prognostic variable is potential
 temperature density `ρθ`. This function converts the `ρθ` boundary conditions to
-energy flux boundary conditions by multiplying by the mixture heat capacity `cᵖᵐ`.
+energy flux boundary conditions using the inverse physical heat response of the
+implemented temperature coordinate.
 """
 function AtmosphereModels.static_energy_density(model::PotentialTemperatureModel)
     ρθ = model.formulation.potential_temperature_density
@@ -33,6 +35,8 @@ function AtmosphereModels.static_energy_density(model::PotentialTemperatureModel
 
     # Convert θ BCs to energy BCs
     ρs_bcs = theta_to_energy_bcs(ρθ_bcs)
+    ρs_bcs = map_field_boundary_conditions(set_energy_flux_response, ρs_bcs,
+        model.formulation, model.dynamics, model.grid, model.microphysics)
 
     # Regularize the converted BCs (populate microphysics, constants, side)
     loc = (Center(), Center(), Center())
@@ -47,6 +51,47 @@ end
 #####
 ##### Tendency computation
 #####
+
+# Convert physical radiative heating Q [W m^-3] into the numerator of the
+# existing theta tendency. Reference-pressure states retain their old formula.
+# Equilibrium-moisture (:ρqᵉ) also retains the LEGACY approximation: its phase
+# partition changes algebraically with theta, and the fixed-phase Jacobian below
+# does not establish energy consistency for saturation adjustment.
+@inline radiative_heat_source(Q, state, constants, ρᵈ, ρ, T, cᵖᵐ, Π, ::Val) = Q
+
+# The current :ρqᵛ implementations store actual vapor and either independent
+# phase reservoirs or no condensate; their thermodynamic diagnostic adjustment
+# is the identity (P3, non-equilibrium bulk schemes, Kessler, or no microphysics).
+# A split microphysical process update is distinct from this instantaneous source.
+# For fixed phases and density, the implemented linear theta definition gives
+#   theta = (T - L) / Pi,  L = (L_l q_l + L_i q_i) / cp,
+#   dtheta/dT = [1 - kappa + kappa L/T] / Pi.
+# Combining rho*cv*dT/dt = Q and the dry-coupled prognostic rho_d*theta yields
+#   d(rho_d*theta)/dt = (rho_d/rho)*(1 + R*L/(cv*T))*Q/(cp*Pi).
+# This uses the current diagnosed T, avoiding a second Newton solve. Newton and
+# FixedIterations are assumed to approximate the implicit root to their stated
+# accuracy. The intentionally non-iterated option has its own derivative below.
+# No change is made to user Fρs, whose existing forcing carrier is rho_d, not rho.
+@inline function radiative_heat_source(Q, state::LiquidIceDensityState, constants,
+                                     ρᵈ, ρ, T, cᵖᵐ, Π, ::Val{:ρqᵛ})
+    q = state.moisture_mass_fractions
+    Rᵐ = mixture_gas_constant(q, constants)
+    cᵛᵐ = cᵖᵐ - Rᵐ
+    L = (constants.liquid.reference_latent_heat * q.liquid +
+         constants.ice.reference_latent_heat * q.ice) / cᵖᵐ
+    factor = radiative_density_factor(state.temperature_solver, state, T, Rᵐ, cᵛᵐ, L, Π)
+    return (ρᵈ / ρ) * factor * Q
+end
+
+@inline radiative_density_factor(solver, state, T, Rᵐ, cᵛᵐ, L, Π) = 1 + Rᵐ * L / (cᵛᵐ * T)
+
+# The explicitly approximate inversion is T = Tdry(theta) + L, Tdry ∝ theta^gamma.
+# Its physical heat response requires d(rho_d*theta)/dt = (rho_d/rho)*Q*theta/[cp*(T-L)].
+# This couples heating to that actual inversion; it does not make it an exact
+# solution of the cloudy implicit root or change the chosen temperature solver.
+@inline function radiative_density_factor(::Nothing, state, T, Rᵐ, cᵛᵐ, L, Π)
+    return Π * state.potential_temperature / (T - L)
+end
 
 function AtmosphereModels.compute_thermodynamic_tendency!(model::PotentialTemperatureModel, common_args)
     grid = model.grid
@@ -98,12 +143,17 @@ end
 
     Fρs = ρs_forcing(i, j, k, grid, clock, model_fields)
     div_ℐ = radiation_flux_divergence(i, j, k, grid, radiation_flux_divergence_field)
+    @inbounds begin
+        ρᵈ = ρ_field[i, j, k]
+        T = model_fields.T[i, j, k]
+    end
+    Qθ = radiative_heat_source(div_ℐ, 𝒰, constants, ρᵈ, ρ, T, cᵖᵐ, Π, Val(moisture_prognostic_name(microphysics)))
 
     return ( - div_ρUc(i, j, k, grid, advection, ρ_field, velocities, potential_temperature)
              + c_div_ρU(i, j, k, grid, dynamics, velocities, potential_temperature)
              - ∇_dot_Jᶜ(i, j, k, grid, ρ_field, closure, closure_fields, id, potential_temperature, clock, model_fields, closure_buoyancy)
              + ρθ_forcing(i, j, k, grid, clock, model_fields)
-             + (Fρs + div_ℐ) / (cᵖᵐ * Π)
+             + (Fρs + Qθ) / (cᵖᵐ * Π)
     )
 end
 

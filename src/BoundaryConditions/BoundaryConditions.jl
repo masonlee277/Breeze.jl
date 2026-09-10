@@ -113,6 +113,7 @@ function AtmosphereModels.materialize_atmosphere_model_boundary_conditions(bound
 
     materialized = Dict{Symbol, Any}()
     for (name, fbcs) in pairs(boundary_conditions)
+        fbcs = map_field_boundary_conditions(set_energy_flux_response, fbcs, formulation, dynamics, grid, microphysics)
         loc = field_location(Val(name))
         materialized[name] = materialize_atmosphere_field_bcs(fbcs, loc, grid, dynamics, microphysics,
                                                               surface_pressure, thermodynamic_constants,

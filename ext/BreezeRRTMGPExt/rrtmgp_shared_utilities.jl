@@ -5,13 +5,16 @@
 using Oceananigans.Operators: ℑzᵃᵃᶠ, Δzᶜᶜᶜ
 using Oceananigans.Architectures: architecture
 using Oceananigans.Fields: ConstantField
+using Oceananigans.Grids: Center, Face, znode
 using Oceananigans.Utils: launch!
 
 using RRTMGP: RRTMGPSolver
 using RRTMGP.AtmosphericStates: AtmosphericState
 using RRTMGP.VolumeMixingRatios: VmrGM
 
-using Breeze.AtmosphereModels: BackgroundAtmosphere, specific_humidity
+using Breeze.AtmosphereModels: BackgroundAtmosphere, specific_prognostic_moisture,
+                              grid_moisture_fractions
+using Breeze.Thermodynamics: MoistureMassFractions, dry_air_mass_fraction
 
 #####
 ##### Volume mixing ratio initialization (shared by clear-sky and all-sky)
@@ -35,30 +38,72 @@ end
 ##### Gas state update (shared by clear-sky and all-sky)
 #####
 
+# Reconstruct from interior pressures in physical height, never dynamical halos.
+@inline function rrtmgp_face_pressure(i, j, k, grid, pressure, density, gravity, ::Val{false})
+    lower = clamp(k - 1, 1, size(grid, 3) - 1)
+    upper = lower + 1
+    z_lower = znode(i, j, lower, grid, Center(), Center(), Center())
+    z_upper = znode(i, j, upper, grid, Center(), Center(), Center())
+    z_face = znode(i, j, k, grid, Center(), Center(), Face())
+    @inbounds p_lower = pressure[i, j, lower]
+    @inbounds p_upper = pressure[i, j, upper]
+    weight = (z_face - z_lower) / (z_upper - z_lower)
+    return p_lower + weight * (p_upper - p_lower)
+end
+
+# A single layer has no resolved pressure gradient. Retain this supported shape
+# with an explicit local hydrostatic boundary closure, not a reconstructed
+# hydrostatic column. Its dry molecular amount still uses the cell's actual mass.
+@inline function rrtmgp_face_pressure(i, j, k, grid, pressure, density, gravity, ::Val{true})
+    z_center = znode(i, j, 1, grid, Center(), Center(), Center())
+    z_face = znode(i, j, k, grid, Center(), Center(), Face())
+    @inbounds return pressure[i, j, 1] - density[i, j, 1] * gravity * (z_face - z_center)
+end
+
+function validate_rrtmgp_gas_columns(as)
+    lower_pressure = @view as.p_lev[1:end - 1, :]
+    upper_pressure = @view as.p_lev[2:end, :]
+    layer_pressure = @view as.layerdata[2, :, :]
+    dry_columns = @view as.layerdata[1, :, :]
+    valid_pressure = all(p -> isfinite(p) & (p > 0), as.p_lev) &&
+                     all(isfinite, layer_pressure) &&
+                     all(lower_pressure .> layer_pressure) &&
+                     all(layer_pressure .> upper_pressure)
+    valid_pressure || throw(ArgumentError(
+        "RRTMGP interface pressures must be positive and strictly bracket every layer pressure."))
+    all(c -> isfinite(c) & (c > 0), dry_columns) || throw(ArgumentError(
+        "RRTMGP requires positive finite physical-layer dry-air column amounts."))
+    return nothing
+end
+
 function update_rrtmgp_gas_state!(as::AtmosphericState, model, surface_temperature,
                                   background_atmosphere::BackgroundAtmosphere, params)
     grid = model.grid
     arch = architecture(grid)
 
-    # RRTMGP assumes level pressures are positive and monotonically decreasing with height. That
-    # holds for the anelastic hydrostatic reference exactly, and for the compressible diagnosed
-    # pressure in practice, whose hydrostatic part dominates dynamic/acoustic perturbations by
-    # orders of magnitude.
+    # Keep the model's diagnosed center pressures. Reconstruct radiative interface
+    # pressures in physical height; a diagnostic field's zero-gradient halos do
+    # not locate the physical top/bottom interfaces of its boundary cells.
     p = dynamics_pressure(model.dynamics)
     T = model.temperature
-    qᵛ = specific_humidity(model)
+    qᵛᵉ = specific_prognostic_moisture(model)
+    ρ = total_density(model.dynamics)
 
     g = params.grav
+    single_layer = Val(size(grid, 3) == 1)
     mᵈ = params.molmass_dryair
     mᵛ = params.molmass_water
     ℕᴬ = params.avogad
     O₃ = background_atmosphere.O₃  # Can be ConstantField or Field
 
-    launch!(arch, grid, :xyz, _update_rrtmgp_gas_state!, as, grid, p, T, qᵛ, surface_temperature, g, mᵈ, mᵛ, ℕᴬ, O₃)
+    launch!(arch, grid, :xyz, _update_rrtmgp_gas_state!, as, grid, p, T, qᵛᵉ, ρ,
+            model.microphysics, model.microphysical_fields, surface_temperature, g, mᵈ, mᵛ, ℕᴬ, O₃, single_layer)
+    validate_rrtmgp_gas_columns(as)
     return nothing
 end
 
-@kernel function _update_rrtmgp_gas_state!(as, grid, p, T, qᵛ, surface_temperature, g, mᵈ, mᵛ, ℕᴬ, O₃)
+@kernel function _update_rrtmgp_gas_state!(as, grid, p, T, qᵛᵉ, ρ, microphysics, microphysical_fields,
+                                         surface_temperature, g, mᵈ, mᵛ, ℕᴬ, O₃, single_layer)
     i, j, k = @index(Global, NTuple)
 
     Nz = size(grid, 3)
@@ -75,11 +120,16 @@ end
     @inbounds begin
         # Layer (cell-centered) values
         pᶜ = p[i, j, k]
-        qᵛₖ = max(qᵛ[i, j, k], zero(eltype(qᵛ)))
+        q = grid_moisture_fractions(i, j, k, grid, microphysics, ρ[i, j, k],
+                                   qᵛᵉ[i, j, k], microphysical_fields)
+        qᵛₖ = max(q.vapor, zero(q.vapor))
+        # Retain the existing negative-vapor policy, but exclude every condensate
+        # reservoir from the dry-air denominator of the moist-total-air fractions.
+        qᵈ = dry_air_mass_fraction(MoistureMassFractions(qᵛₖ, q.liquid, q.ice))
 
-        # Face values at k and k+1 (needed for column dry air mass and level temperatures)
-        pᶠₖ = ℑzᵃᵃᶠ(i, j, k, grid, p)
-        pᶠₖ₊₁ = ℑzᵃᵃᶠ(i, j, k+1, grid, p)
+        # Reconstruct pressure at the lower physical face; retain the existing
+        # face-temperature staging and Planck-source smoothing policy.
+        pᶠₖ = rrtmgp_face_pressure(i, j, k, grid, p, ρ, g, single_layer)
         Tᶠₖ = ℑzᵃᵃᶠ(i, j, k, grid, T)
         Tᶠₖ₊₁ = ℑzᵃᵃᶠ(i, j, k+1, grid, T)
 
@@ -105,27 +155,39 @@ end
 
         # Topmost level (once)
         if k == 1
-            pᶠ[Nz+1, c] = ℑzᵃᵃᶠ(i, j, Nz+1, grid, p)
+            pᶠ[Nz + 1, c] = rrtmgp_face_pressure(i, j, Nz + 1, grid, p, ρ, g, single_layer)
             Tᴺ⁺¹ = ℑzᵃᵃᶠ(i, j, Nz+1, grid, T)
             Tᶠ[Nz+1, c] = clamp(Tᴺ⁺¹, Tmin, Tmax)
             T₀[c] = clamp(surface_temperature[i, j, 1], Tmin, Tmax)
         end
 
-        # Column dry air mass: molecules / cm² of dry air
-        Δp = max(pᶠₖ - pᶠₖ₊₁, zero(pᶠₖ))
-        dry_mass_fraction = 1 - qᵛₖ
-        dry_mass_per_area = (Δp / g) * dry_mass_fraction
+        # Integrate the represented dry-air density over this physical layer,
+        # exactly as cloud paths integrate condensate density. Using Δp/g would
+        # impose hydrostatic balance on compressible states and make gas mass
+        # depend on pressure interpolation and boundary halo policies.
+        Δz = Δzᶜᶜᶜ(i, j, k, grid)
+        ρₖ = ρ[i, j, k]
+        # Validate factors independently: two negative factors can otherwise
+        # produce a positive optical mass. Keep the existing vapor-to-zero
+        # policy; this does not replace temperature or trace-gas validation.
+        valid_mass = isfinite(ρₖ) & (ρₖ > 0) &
+                     isfinite(Δz) & (Δz > 0) &
+                     isfinite(q.vapor) &
+                     isfinite(qᵈ) & (qᵈ > 0) & (qᵈ <= 1) &
+                     isfinite(q.liquid) & (q.liquid >= 0) &
+                     isfinite(q.ice) & (q.ice >= 0)
+        dry_mass_per_area = ρₖ * qᵈ * Δz
         m⁻²_to_cm⁻² = convert(eltype(pᶜ), 1e4)
         column_dry = dry_mass_per_area / mᵈ * ℕᴬ / m⁻²_to_cm⁻² # (molecules / m²) -> (molecules / cm²)
 
         # Populate layerdata: (column_dry, pᶜ, Tᶜ, relative_humidity)
-        layerdata[1, k, c] = column_dry
+        layerdata[1, k, c] = ifelse(valid_mass, column_dry, oftype(column_dry, NaN))
         layerdata[2, k, c] = pᶜ
         layerdata[3, k, c] = Tᶜ
         layerdata[4, k, c] = zero(eltype(Tᶜ))
 
         # H₂O volume mixing ratio from specific humidity
-        r = qᵛₖ / dry_mass_fraction
+        r = qᵛₖ / qᵈ
         vmr_h2o[k, c] = r * (mᵈ / mᵛ)
 
         # O₃ volume mixing ratio - index into field (works for ConstantField or Field)

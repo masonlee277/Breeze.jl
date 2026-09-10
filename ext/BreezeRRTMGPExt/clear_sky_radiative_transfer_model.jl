@@ -8,7 +8,7 @@ using Oceananigans.Grids: xnode, ynode, λnode, φnode, znodes
 using Oceananigans.Grids: AbstractGrid, Center, Face
 using Oceananigans.Fields: ConstantField
 
-using Breeze.AtmosphereModels: AtmosphereModels, SurfaceRadiativeProperties, specific_humidity,
+using Breeze.AtmosphereModels: AtmosphereModels, SurfaceRadiativeProperties,
                                BackgroundAtmosphere, materialize_background_atmosphere,
                                ClearSkyOptics, RadiativeTransferModel,
                                AbstractSolarPosition, ApparentSolarPosition,
@@ -32,6 +32,10 @@ Construct a clear-sky (gas-only) full-spectrum `RadiativeTransferModel` for the 
 
 This constructor requires that `NCDatasets` is loadable in the user environment because
 RRTMGP loads lookup tables from netCDF via an extension.
+Interface pressures are reconstructed from interior center pressures in physical height.
+For a single-layer grid, the unresolved boundary gradient uses a local hydrostatic
+closure with the layer's total density. Molecular columns use actual physical-layer
+mass in either case; diagnostic pressure halos are never used.
 
 # Keyword Arguments
 - `background_atmosphere`: Background atmospheric gas composition (default: `BackgroundAtmosphere()`).

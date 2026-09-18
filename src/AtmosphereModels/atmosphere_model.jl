@@ -5,7 +5,7 @@ using Oceananigans: Oceananigans, AbstractModel, Center, CenterField, Clock, Fie
 using Oceananigans.Advection: Advection, adapt_advection_order, cell_advection_timescale, materialize_advection
 using Oceananigans.AbstractOperations: @at
 using Oceananigans.Architectures: Architectures, on_architecture
-using Oceananigans.BoundaryConditions: FieldBoundaryConditions, regularize_field_boundary_conditions, needs_implicit_solver
+using Oceananigans.BoundaryConditions: BoundaryCondition, FieldBoundaryConditions, regularize_field_boundary_conditions, needs_implicit_solver
 using Oceananigans.Diagnostics: Diagnostics as OceananigansDiagnostics, NaNChecker
 using Oceananigans.Models: Models, validate_model_halo, validate_tracer_advection
 using Oceananigans.TimeSteppers: TimeSteppers, TimeStepper, AbstractLagrangianParticles, step_lagrangian_particles!
@@ -303,6 +303,8 @@ function AtmosphereModel(grid;
     # is the single definition both sites go through.
     model_fields = merge(prognostic_model_fields, fields(formulation), velocities,
                          auxiliary_model_fields(temperature), microphysical_fields)
+    validate_boundary_condition_field_dependencies(regularized_boundary_conditions, all_names,
+                                                   keys(model_fields))
     coupling_density = dynamics_density(dynamics)
     mass_density = total_density(dynamics)
 
@@ -521,6 +523,52 @@ function invalid_key_hint(name)
     end
 
     return ""
+end
+
+"""
+$(TYPEDSIGNATURES)
+
+Reject a boundary condition whose `field_dependencies` would be read from the wrong field.
+
+`regularize_field_boundary_conditions` resolves each dependency name to a positional index into
+the names it is given, and `getbc` reads that position out of `Oceananigans.fields(model)` at run
+time. The two tuples agree over the prognostic fields, the formulation's own fields, the
+velocities and the temperature, and then diverge: the names passed to regularization carry only
+the moisture diagnostic, while `fields(model)` carries the microphysics scheme's whole inventory.
+A dependency naming anything past that point resolves to an index that holds a different field,
+and the condition is then evaluated against it with no error and a plausible value — under P3,
+`:qᵛ` resolves to the position `:qᶜˡ` occupies.
+
+Forcings are unaffected: they resolve against `model_fields`, which is built to mirror
+`fields(model)`.
+"""
+function validate_boundary_condition_field_dependencies(boundary_conditions, resolved_names, runtime_names)
+    for (field_name, field_bcs) in pairs(boundary_conditions)
+        for side in propertynames(field_bcs)
+            bc = getproperty(field_bcs, side)
+            bc isa BoundaryCondition || continue
+            condition = bc.condition
+            hasproperty(condition, :field_dependencies) || continue
+
+            for dependency in condition.field_dependencies
+                resolved = findfirst(==(dependency), resolved_names)
+                isnothing(resolved) && continue
+                actual = runtime_names[resolved]
+                actual === dependency && continue
+
+                throw(ArgumentError(string(
+                    "The ", side, " boundary condition on ", field_name, " depends on `",
+                    dependency, "`, which cannot be read correctly.\n",
+                    "`", dependency, "` is resolved to index ", resolved,
+                    ", and that index holds `", actual, "` in the fields the condition is ",
+                    "evaluated against.\n",
+                    "Depend on one of ", Tuple(name for (i, name) in enumerate(resolved_names)
+                                               if i <= length(runtime_names) && runtime_names[i] === name),
+                    " instead, or write the condition in discrete form and read the field by name.")))
+            end
+        end
+    end
+    return nothing
 end
 
 """

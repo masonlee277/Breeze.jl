@@ -5,6 +5,7 @@ using Breeze
 using Breeze.AtmosphereModels: thermodynamic_density, base_pressure, standard_pressure
 using Breeze.BoundaryConditions: EnergyFluxBoundaryCondition, FilteredSurfaceVelocities,
                                  wall_air_pressure, surface_layer_state
+using Breeze.Microphysics.PredictedParticleProperties: PredictedParticlePropertiesMicrophysics
 using Breeze.Thermodynamics: potential_temperature_from_temperature
 using GPUArraysCore: @allowscalar
 using Oceananigans: Oceananigans
@@ -317,6 +318,25 @@ end
     @test all(bottom_flux_tendency((:u, :v), 2) .== 0)
     @test all(bottom_flux_tendency((:ρu, :ρv), 1) .≈ FT(-8.75) / Δz)
     @test all(bottom_flux_tendency((:ρu, :ρv), 2) .== 0)
+
+    # Every name above lies in the prefix the two tuples share, so none of them can detect a
+    # misalignment further along. Under P3 the names handed to regularization stop after the
+    # moisture diagnostic while the fields the condition is read from carry the scheme's whole
+    # inventory, so `:qᵛ` resolves to the index holding `:qᶜˡ`. That has to be refused, not
+    # evaluated against the wrong field.
+    p3 = PredictedParticlePropertiesMicrophysics(FT)
+    @inline depends_on_vapor(x, y, t, qᵛ) = qᵛ
+    vapor_bcs = FieldBoundaryConditions(bottom = FluxBoundaryCondition(depends_on_vapor,
+                                                                       field_dependencies = :qᵛ))
+    @test_throws ArgumentError AtmosphereModel(grid; dynamics, microphysics = p3,
+                                                     boundary_conditions = (; ρv = vapor_bcs))
+
+    # A dependency inside the shared prefix still works under the same microphysics.
+    @inline depends_on_u(x, y, t, u) = u
+    u_bcs = FieldBoundaryConditions(bottom = FluxBoundaryCondition(depends_on_u,
+                                                                    field_dependencies = :u))
+    @test_nowarn AtmosphereModel(grid; dynamics, microphysics = p3,
+                                       boundary_conditions = (; ρv = u_bcs))
 end
 
 # The same positional lookup, under `AnelasticDynamics`, whose pressure and density are
